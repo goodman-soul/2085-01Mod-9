@@ -376,6 +376,64 @@ static int db_init(void) {
         "  FOREIGN KEY(operator_user_id) REFERENCES users(id)"
         ");"
 
+        "CREATE TABLE IF NOT EXISTS suppliers ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  name TEXT NOT NULL UNIQUE,"
+        "  contact_name TEXT,"
+        "  contact_phone TEXT,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS cabinets ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  cabinet_code TEXT NOT NULL UNIQUE,"
+        "  name TEXT NOT NULL,"
+        "  location TEXT,"
+        "  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive')),"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS product_batches ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  product_id INTEGER NOT NULL,"
+        "  batch_no TEXT NOT NULL UNIQUE,"
+        "  supplier_id INTEGER NOT NULL,"
+        "  production_date TEXT NOT NULL,"
+        "  arrival_quantity INTEGER NOT NULL CHECK(arrival_quantity > 0),"
+        "  expiry_date TEXT NOT NULL,"
+        "  note TEXT,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(product_id) REFERENCES products(id),"
+        "  FOREIGN KEY(supplier_id) REFERENCES suppliers(id)"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS cabinet_batch_stock ("
+        "  cabinet_id INTEGER NOT NULL,"
+        "  batch_id INTEGER NOT NULL,"
+        "  current_quantity INTEGER NOT NULL DEFAULT 0 CHECK(current_quantity >= 0),"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (cabinet_id, batch_id),"
+        "  FOREIGN KEY(cabinet_id) REFERENCES cabinets(id),"
+        "  FOREIGN KEY(batch_id) REFERENCES product_batches(id)"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS sales_orders ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  order_no TEXT NOT NULL UNIQUE,"
+        "  cabinet_id INTEGER NOT NULL,"
+        "  batch_id INTEGER NOT NULL,"
+        "  product_id INTEGER NOT NULL,"
+        "  quantity INTEGER NOT NULL CHECK(quantity > 0),"
+        "  unit_price_cents INTEGER NOT NULL CHECK(unit_price_cents >= 0),"
+        "  total_price_cents INTEGER NOT NULL CHECK(total_price_cents >= 0),"
+        "  note TEXT,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(cabinet_id) REFERENCES cabinets(id),"
+        "  FOREIGN KEY(batch_id) REFERENCES product_batches(id),"
+        "  FOREIGN KEY(product_id) REFERENCES products(id)"
+        ");"
+
         "CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);"
         "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);"
         "CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku);"
@@ -383,9 +441,24 @@ static int db_init(void) {
         "stock_movements(product_id);"
         "CREATE INDEX IF NOT EXISTS idx_movements_created_at ON "
         "stock_movements(created_at);"
+        "CREATE INDEX IF NOT EXISTS idx_batches_product_id ON product_batches(product_id);"
+        "CREATE INDEX IF NOT EXISTS idx_batches_supplier_id ON product_batches(supplier_id);"
+        "CREATE INDEX IF NOT EXISTS idx_batches_production_date ON product_batches(production_date);"
+        "CREATE INDEX IF NOT EXISTS idx_cabinet_stock_cabinet_id ON cabinet_batch_stock(cabinet_id);"
+        "CREATE INDEX IF NOT EXISTS idx_cabinet_stock_batch_id ON cabinet_batch_stock(batch_id);"
+        "CREATE INDEX IF NOT EXISTS idx_orders_cabinet_id ON sales_orders(cabinet_id);"
+        "CREATE INDEX IF NOT EXISTS idx_orders_batch_id ON sales_orders(batch_id);"
+        "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON sales_orders(created_at);"
 
         "INSERT OR IGNORE INTO products (sku, name, unit, stock_quantity) VALUES "
-        "('SEED-WATER-550', '系统示例矿泉水550ml', '瓶', 50);";
+        "('SEED-WATER-550', '系统示例矿泉水550ml', '瓶', 50);"
+
+        "INSERT OR IGNORE INTO suppliers (name, contact_name, contact_phone) VALUES "
+        "('示例水厂', '张经理', '13800000001');"
+
+        "INSERT OR IGNORE INTO cabinets (cabinet_code, name, location, status) VALUES "
+        "('CAB-001', '东门柜机', '园区东门入口', 'active'),"
+        "('CAB-002', '办公楼柜机', 'A座办公楼一楼', 'active');";
 
     if (db_exec(schema_sql) != 0) {
         return -1;
@@ -1743,6 +1816,1270 @@ static enum MHD_Result handle_movements(struct MHD_Connection *connection) {
     return respond_success(connection, MHD_HTTP_OK, items);
 }
 
+static enum MHD_Result handle_create_supplier(struct MHD_Connection *connection,
+                                              ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *name = NULL;
+    if (require_string_field(body, "name", 128, &name) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "name 必填");
+    }
+
+    const char *contact_name = optional_string_field(body, "contact_name", 64);
+    const char *contact_phone = optional_string_field(body, "contact_phone", 32);
+    if (contact_name == NULL || contact_phone == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "contact_name/contact_phone 必须是字符串");
+    }
+
+    char name_copy[129];
+    char contact_name_copy[65];
+    char contact_phone_copy[33];
+    snprintf(name_copy, sizeof(name_copy), "%s", name);
+    snprintf(contact_name_copy, sizeof(contact_name_copy), "%s",
+             contact_name ? contact_name : "");
+    snprintf(contact_phone_copy, sizeof(contact_phone_copy), "%s",
+             contact_phone ? contact_phone : "");
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可新增供应商");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO suppliers (name, contact_name, contact_phone) VALUES (?, ?, ?);";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "新增供应商失败");
+    }
+
+    sqlite3_bind_text(stmt, 1, name_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, contact_name_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, contact_phone_copy, -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    if (rc != SQLITE_DONE) {
+        if (rc == SQLITE_CONSTRAINT) {
+            return respond_error(connection, MHD_HTTP_CONFLICT, "CONFLICT",
+                                "供应商名称已存在");
+        }
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "新增供应商失败");
+    }
+
+    json_t *data = json_object();
+    json_object_set_new(data, "name", json_string(name_copy));
+    return respond_success(connection, MHD_HTTP_CREATED, data);
+}
+
+static enum MHD_Result handle_list_suppliers(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT id, name, contact_name, contact_phone, created_at "
+        "FROM suppliers ORDER BY id DESC;";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询供应商列表失败");
+    }
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *it = json_object();
+        json_object_set_new(it, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(it, "name", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(it, "contact_name",
+                            json_string(safe_col_text(stmt, 2)));
+        json_object_set_new(it, "contact_phone",
+                            json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(it, "created_at",
+                            json_string(safe_col_text(stmt, 4)));
+        json_array_append_new(items, it);
+    }
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取供应商列表失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
+static enum MHD_Result handle_create_cabinet(struct MHD_Connection *connection,
+                                             ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *cabinet_code = NULL;
+    const char *name = NULL;
+    if (require_string_field(body, "cabinet_code", 32, &cabinet_code) != 0 ||
+        require_string_field(body, "name", 128, &name) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "cabinet_code/name 必填");
+    }
+
+    const char *location = optional_string_field(body, "location", 256);
+    const char *status = optional_string_field(body, "status", 16);
+    if (location == NULL || status == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "location/status 必须是字符串");
+    }
+
+    char cabinet_code_copy[33];
+    char name_copy[129];
+    char location_copy[257];
+    char status_copy[17];
+    snprintf(cabinet_code_copy, sizeof(cabinet_code_copy), "%s", cabinet_code);
+    snprintf(name_copy, sizeof(name_copy), "%s", name);
+    snprintf(location_copy, sizeof(location_copy), "%s",
+             location ? location : "");
+    snprintf(status_copy, sizeof(status_copy), "%s",
+             (status && *status) ? status : "active");
+
+    if (strcmp(status_copy, "active") != 0 &&
+        strcmp(status_copy, "inactive") != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "status 仅支持 active/inactive");
+    }
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可新增柜机");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO cabinets (cabinet_code, name, location, status) VALUES (?, ?, ?, ?);";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "新增柜机失败");
+    }
+
+    sqlite3_bind_text(stmt, 1, cabinet_code_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, name_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, location_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, status_copy, -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    if (rc != SQLITE_DONE) {
+        if (rc == SQLITE_CONSTRAINT) {
+            return respond_error(connection, MHD_HTTP_CONFLICT, "CONFLICT",
+                                "柜机编号已存在");
+        }
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "新增柜机失败");
+    }
+
+    json_t *data = json_object();
+    json_object_set_new(data, "cabinet_code", json_string(cabinet_code_copy));
+    json_object_set_new(data, "name", json_string(name_copy));
+    return respond_success(connection, MHD_HTTP_CREATED, data);
+}
+
+static enum MHD_Result handle_list_cabinets(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT id, cabinet_code, name, location, status, created_at "
+        "FROM cabinets ORDER BY id DESC;";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询柜机列表失败");
+    }
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *it = json_object();
+        json_object_set_new(it, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(it, "cabinet_code",
+                            json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(it, "name", json_string(safe_col_text(stmt, 2)));
+        json_object_set_new(it, "location",
+                            json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(it, "status", json_string(safe_col_text(stmt, 4)));
+        json_object_set_new(it, "created_at",
+                            json_string(safe_col_text(stmt, 5)));
+        json_array_append_new(items, it);
+    }
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取柜机列表失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
+static enum MHD_Result handle_create_batch(struct MHD_Connection *connection,
+                                           ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *sku = NULL;
+    const char *batch_no = NULL;
+    const char *supplier_name = NULL;
+    const char *production_date = NULL;
+    const char *expiry_date = NULL;
+    if (require_string_field(body, "sku", 64, &sku) != 0 ||
+        require_string_field(body, "batch_no", 64, &batch_no) != 0 ||
+        require_string_field(body, "supplier_name", 128, &supplier_name) != 0 ||
+        require_string_field(body, "production_date", 32, &production_date) != 0 ||
+        require_string_field(body, "expiry_date", 32, &expiry_date) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "sku/batch_no/supplier_name/production_date/expiry_date 必填");
+    }
+
+    int arrival_quantity = 0;
+    int unit_cost = 0;
+    if (parse_int_field(body, "arrival_quantity", 1, 1000000, &arrival_quantity) != 0 ||
+        parse_int_field(body, "unit_cost_cents", 0, 100000000, &unit_cost) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "arrival_quantity/unit_cost_cents 必须为合法整数");
+    }
+
+    const char *note = optional_string_field(body, "note", 256);
+    if (note == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "note 需为字符串且不超过256字符");
+    }
+
+    char sku_copy[65];
+    char batch_no_copy[65];
+    char supplier_name_copy[129];
+    char production_date_copy[33];
+    char expiry_date_copy[33];
+    char note_copy[257];
+    snprintf(sku_copy, sizeof(sku_copy), "%s", sku);
+    snprintf(batch_no_copy, sizeof(batch_no_copy), "%s", batch_no);
+    snprintf(supplier_name_copy, sizeof(supplier_name_copy), "%s", supplier_name);
+    snprintf(production_date_copy, sizeof(production_date_copy), "%s", production_date);
+    snprintf(expiry_date_copy, sizeof(expiry_date_copy), "%s", expiry_date);
+    snprintf(note_copy, sizeof(note_copy), "%s", note ? note : "");
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可创建批次");
+    }
+
+    if (begin_transaction() != 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "开启事务失败");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int product_id = 0;
+
+    const char *find_product_sql =
+        "SELECT id FROM products WHERE sku = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_product_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询商品失败");
+    }
+    sqlite3_bind_text(stmt, 1, sku_copy, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "商品不存在");
+    }
+    product_id = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    int supplier_id = 0;
+    const char *find_supplier_sql =
+        "SELECT id FROM suppliers WHERE name = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_supplier_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询供应商失败");
+    }
+    sqlite3_bind_text(stmt, 1, supplier_name_copy, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        supplier_id = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    } else {
+        sqlite3_finalize(stmt);
+        const char *ins_supplier_sql =
+            "INSERT INTO suppliers (name) VALUES (?);";
+        if (sqlite3_prepare_v2(g_db, ins_supplier_sql, -1, &stmt, NULL) != SQLITE_OK) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                "DB_ERROR", "创建供应商失败");
+        }
+        sqlite3_bind_text(stmt, 1, supplier_name_copy, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                "DB_ERROR", "创建供应商失败");
+        }
+        supplier_id = (int)sqlite3_last_insert_rowid(g_db);
+    }
+
+    const char *ins_batch_sql =
+        "INSERT INTO product_batches "
+        "(product_id, batch_no, supplier_id, production_date, "
+        "arrival_quantity, expiry_date, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+
+    if (sqlite3_prepare_v2(g_db, ins_batch_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建批次失败");
+    }
+
+    sqlite3_bind_int(stmt, 1, product_id);
+    sqlite3_bind_text(stmt, 2, batch_no_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, supplier_id);
+    sqlite3_bind_text(stmt, 4, production_date_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, arrival_quantity);
+    sqlite3_bind_text(stmt, 6, expiry_date_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, note_copy, -1, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        if (rc == SQLITE_CONSTRAINT) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_CONFLICT, "CONFLICT",
+                                "批次号已存在");
+        }
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建批次失败");
+    }
+
+    int batch_id = (int)sqlite3_last_insert_rowid(g_db);
+
+    const char *update_stock_sql =
+        "UPDATE products SET stock_quantity = stock_quantity + ?, "
+        "updated_at = CURRENT_TIMESTAMP WHERE id = ?;";
+    if (sqlite3_prepare_v2(g_db, update_stock_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新库存失败");
+    }
+    sqlite3_bind_int(stmt, 1, arrival_quantity);
+    sqlite3_bind_int(stmt, 2, product_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新库存失败");
+    }
+
+    const char *ins_movement_sql =
+        "INSERT INTO stock_movements "
+        "(product_id, movement_type, quantity, unit_price_cents, note, "
+        "operator_user_id) "
+        "VALUES (?, 'IN', ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, ins_movement_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入流水失败");
+    }
+    sqlite3_bind_int(stmt, 1, product_id);
+    sqlite3_bind_int(stmt, 2, arrival_quantity);
+    sqlite3_bind_int(stmt, 3, unit_cost);
+    sqlite3_bind_text(stmt, 4, note_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, user.user_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE || commit_transaction() != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "提交批次入库事务失败");
+    }
+
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "batch_id", json_integer(batch_id));
+    json_object_set_new(data, "batch_no", json_string(batch_no_copy));
+    json_object_set_new(data, "sku", json_string(sku_copy));
+    json_object_set_new(data, "supplier", json_string(supplier_name_copy));
+    json_object_set_new(data, "arrival_quantity", json_integer(arrival_quantity));
+    return respond_success(connection, MHD_HTTP_CREATED, data);
+}
+
+static enum MHD_Result handle_list_batches(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    int limit = parse_limit_query(connection);
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT b.id, b.batch_no, p.sku, p.name, s.name as supplier_name, "
+        "b.production_date, b.arrival_quantity, b.expiry_date, b.note, b.created_at "
+        "FROM product_batches b "
+        "JOIN products p ON p.id = b.product_id "
+        "JOIN suppliers s ON s.id = b.supplier_id "
+        "ORDER BY b.id DESC LIMIT ?;";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询批次列表失败");
+    }
+
+    sqlite3_bind_int(stmt, 1, limit);
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *it = json_object();
+        json_object_set_new(it, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(it, "batch_no", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(it, "sku", json_string(safe_col_text(stmt, 2)));
+        json_object_set_new(it, "product_name",
+                            json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(it, "supplier_name",
+                            json_string(safe_col_text(stmt, 4)));
+        json_object_set_new(it, "production_date",
+                            json_string(safe_col_text(stmt, 5)));
+        json_object_set_new(it, "arrival_quantity",
+                            json_integer(sqlite3_column_int(stmt, 6)));
+        json_object_set_new(it, "expiry_date",
+                            json_string(safe_col_text(stmt, 7)));
+        json_object_set_new(it, "note", json_string(safe_col_text(stmt, 8)));
+        json_object_set_new(it, "created_at",
+                            json_string(safe_col_text(stmt, 9)));
+        json_array_append_new(items, it);
+    }
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取批次列表失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
+static enum MHD_Result handle_place_batch(struct MHD_Connection *connection,
+                                          ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *batch_no = NULL;
+    const char *cabinet_code = NULL;
+    if (require_string_field(body, "batch_no", 64, &batch_no) != 0 ||
+        require_string_field(body, "cabinet_code", 32, &cabinet_code) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "batch_no/cabinet_code 必填");
+    }
+
+    int quantity = 0;
+    if (parse_int_field(body, "quantity", 1, 1000000, &quantity) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "quantity 必须为合法正整数");
+    }
+
+    char batch_no_copy[65];
+    char cabinet_code_copy[33];
+    snprintf(batch_no_copy, sizeof(batch_no_copy), "%s", batch_no);
+    snprintf(cabinet_code_copy, sizeof(cabinet_code_copy), "%s", cabinet_code);
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可入柜");
+    }
+
+    if (begin_transaction() != 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "开启事务失败");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int batch_id = 0;
+    int arrival_quantity = 0;
+
+    const char *find_batch_sql =
+        "SELECT id, arrival_quantity FROM product_batches "
+        "WHERE batch_no = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_batch_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询批次失败");
+    }
+    sqlite3_bind_text(stmt, 1, batch_no_copy, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "批次不存在");
+    }
+    batch_id = sqlite3_column_int(stmt, 0);
+    arrival_quantity = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+
+    int cabinet_id = 0;
+    const char *find_cabinet_sql =
+        "SELECT id FROM cabinets WHERE cabinet_code = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_cabinet_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询柜机失败");
+    }
+    sqlite3_bind_text(stmt, 1, cabinet_code_copy, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "柜机不存在");
+    }
+    cabinet_id = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    int placed_quantity = 0;
+    const char *sum_placed_sql =
+        "SELECT COALESCE(SUM(current_quantity), 0) FROM cabinet_batch_stock "
+        "WHERE batch_id = ?;";
+    if (sqlite3_prepare_v2(g_db, sum_placed_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询已入柜数量失败");
+    }
+    sqlite3_bind_int(stmt, 1, batch_id);
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        placed_quantity = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    if (placed_quantity + quantity > arrival_quantity) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "INSUFFICIENT_BATCH",
+                            "入柜数量超过批次到货数量");
+    }
+
+    const char *upsert_sql =
+        "INSERT INTO cabinet_batch_stock (cabinet_id, batch_id, current_quantity) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(cabinet_id, batch_id) DO UPDATE SET "
+        "current_quantity = current_quantity + ?, "
+        "updated_at = CURRENT_TIMESTAMP;";
+    if (sqlite3_prepare_v2(g_db, upsert_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新柜机批次库存失败");
+    }
+    sqlite3_bind_int(stmt, 1, cabinet_id);
+    sqlite3_bind_int(stmt, 2, batch_id);
+    sqlite3_bind_int(stmt, 3, quantity);
+    sqlite3_bind_int(stmt, 4, quantity);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE || commit_transaction() != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "提交入柜事务失败");
+    }
+
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "batch_no", json_string(batch_no_copy));
+    json_object_set_new(data, "cabinet_code", json_string(cabinet_code_copy));
+    json_object_set_new(data, "quantity", json_integer(quantity));
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static int generate_order_no(char *out, size_t out_size) {
+    time_t t = now_epoch();
+    struct tm tm_info;
+    localtime_r(&t, &tm_info);
+
+    char prefix[32];
+    strftime(prefix, sizeof(prefix), "ORD%Y%m%d%H%M%S", &tm_info);
+
+    unsigned char rand_bytes[4];
+    randombytes_buf(rand_bytes, sizeof(rand_bytes));
+    char rand_hex[9];
+    bytes_to_hex(rand_bytes, sizeof(rand_bytes), rand_hex);
+
+    snprintf(out, out_size, "%s%s", prefix, rand_hex);
+    return 0;
+}
+
+static enum MHD_Result handle_cabinet_sales(struct MHD_Connection *connection,
+                                            ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *cabinet_code = NULL;
+    const char *batch_no = NULL;
+    if (require_string_field(body, "cabinet_code", 32, &cabinet_code) != 0 ||
+        require_string_field(body, "batch_no", 64, &batch_no) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "cabinet_code/batch_no 必填");
+    }
+
+    int quantity = 0;
+    int unit_price = 0;
+    if (parse_int_field(body, "quantity", 1, 1000000, &quantity) != 0 ||
+        parse_int_field(body, "unit_price_cents", 0, 100000000, &unit_price) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "quantity/unit_price_cents 必须为合法整数");
+    }
+
+    const char *note = optional_string_field(body, "note", 256);
+    if (note == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "note 需为字符串且不超过256字符");
+    }
+
+    char cabinet_code_copy[33];
+    char batch_no_copy[65];
+    char note_copy[257];
+    snprintf(cabinet_code_copy, sizeof(cabinet_code_copy), "%s", cabinet_code);
+    snprintf(batch_no_copy, sizeof(batch_no_copy), "%s", batch_no);
+    snprintf(note_copy, sizeof(note_copy), "%s", note ? note : "");
+
+    int total_price = quantity * unit_price;
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (begin_transaction() != 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "开启事务失败");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int cabinet_id = 0;
+    int batch_id = 0;
+    int product_id = 0;
+    int current_qty = 0;
+
+    const char *find_sql =
+        "SELECT c.id, b.id, b.product_id, s.current_quantity "
+        "FROM cabinet_batch_stock s "
+        "JOIN cabinets c ON c.id = s.cabinet_id "
+        "JOIN product_batches b ON b.id = s.batch_id "
+        "WHERE c.cabinet_code = ? AND b.batch_no = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询柜机批次库存失败");
+    }
+    sqlite3_bind_text(stmt, 1, cabinet_code_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, batch_no_copy, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "柜机中无该批次库存");
+    }
+    cabinet_id = sqlite3_column_int(stmt, 0);
+    batch_id = sqlite3_column_int(stmt, 1);
+    product_id = sqlite3_column_int(stmt, 2);
+    current_qty = sqlite3_column_int(stmt, 3);
+    sqlite3_finalize(stmt);
+
+    if (current_qty < quantity) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "INSUFFICIENT_STOCK",
+                            "柜机批次库存不足");
+    }
+
+    const char *update_stock_sql =
+        "UPDATE cabinet_batch_stock SET current_quantity = current_quantity - ?, "
+        "updated_at = CURRENT_TIMESTAMP "
+        "WHERE cabinet_id = ? AND batch_id = ?;";
+    if (sqlite3_prepare_v2(g_db, update_stock_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新柜机库存失败");
+    }
+    sqlite3_bind_int(stmt, 1, quantity);
+    sqlite3_bind_int(stmt, 2, cabinet_id);
+    sqlite3_bind_int(stmt, 3, batch_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新柜机库存失败");
+    }
+
+    const char *update_product_sql =
+        "UPDATE products SET stock_quantity = stock_quantity - ?, "
+        "updated_at = CURRENT_TIMESTAMP WHERE id = ?;";
+    if (sqlite3_prepare_v2(g_db, update_product_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新商品库存失败");
+    }
+    sqlite3_bind_int(stmt, 1, quantity);
+    sqlite3_bind_int(stmt, 2, product_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新商品库存失败");
+    }
+
+    const char *ins_movement_sql =
+        "INSERT INTO stock_movements "
+        "(product_id, movement_type, quantity, unit_price_cents, note, "
+        "operator_user_id) "
+        "VALUES (?, 'OUT', ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, ins_movement_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入流水失败");
+    }
+    sqlite3_bind_int(stmt, 1, product_id);
+    sqlite3_bind_int(stmt, 2, quantity);
+    sqlite3_bind_int(stmt, 3, unit_price);
+    sqlite3_bind_text(stmt, 4, note_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, user.user_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入流水失败");
+    }
+
+    char order_no[64];
+    generate_order_no(order_no, sizeof(order_no));
+
+    const char *ins_order_sql =
+        "INSERT INTO sales_orders "
+        "(order_no, cabinet_id, batch_id, product_id, quantity, "
+        "unit_price_cents, total_price_cents, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, ins_order_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建订单失败");
+    }
+    sqlite3_bind_text(stmt, 1, order_no, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, cabinet_id);
+    sqlite3_bind_int(stmt, 3, batch_id);
+    sqlite3_bind_int(stmt, 4, product_id);
+    sqlite3_bind_int(stmt, 5, quantity);
+    sqlite3_bind_int(stmt, 6, unit_price);
+    sqlite3_bind_int(stmt, 7, total_price);
+    sqlite3_bind_text(stmt, 8, note_copy, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE || commit_transaction() != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "提交销售事务失败");
+    }
+
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "order_no", json_string(order_no));
+    json_object_set_new(data, "cabinet_code", json_string(cabinet_code_copy));
+    json_object_set_new(data, "batch_no", json_string(batch_no_copy));
+    json_object_set_new(data, "quantity", json_integer(quantity));
+    json_object_set_new(data, "total_price_cents", json_integer(total_price));
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_recall_query(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可查询召回信息");
+    }
+
+    const char *batch_no =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "batch_no");
+    const char *supplier_name =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "supplier_name");
+    const char *production_date_from =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "production_date_from");
+    const char *production_date_to =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "production_date_to");
+
+    int has_filter = 0;
+    char where_clause[512] = {0};
+    strcat(where_clause, "WHERE 1=1");
+
+    if (batch_no != NULL && *batch_no != '\0') {
+        strcat(where_clause, " AND b.batch_no = ?");
+        has_filter = 1;
+    }
+    if (supplier_name != NULL && *supplier_name != '\0') {
+        strcat(where_clause, " AND s.name = ?");
+        has_filter = 1;
+    }
+    if (production_date_from != NULL && *production_date_from != '\0') {
+        strcat(where_clause, " AND b.production_date >= ?");
+        has_filter = 1;
+    }
+    if (production_date_to != NULL && *production_date_to != '\0') {
+        strcat(where_clause, " AND b.production_date <= ?");
+        has_filter = 1;
+    }
+
+    if (!has_filter) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "请至少提供一个查询条件：batch_no / supplier_name / production_date_from / production_date_to");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+
+    char batch_sql[1024];
+    snprintf(batch_sql, sizeof(batch_sql),
+        "SELECT DISTINCT b.id, b.batch_no, p.sku, p.name, s.name as supplier_name, "
+        "b.production_date, b.arrival_quantity, b.expiry_date "
+        "FROM product_batches b "
+        "JOIN products p ON p.id = b.product_id "
+        "JOIN suppliers s ON s.id = b.supplier_id "
+        "%s "
+        "ORDER BY b.id DESC;",
+        where_clause);
+
+    if (sqlite3_prepare_v2(g_db, batch_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询召回批次失败");
+    }
+
+    int bind_idx = 1;
+    if (batch_no != NULL && *batch_no != '\0') {
+        sqlite3_bind_text(stmt, bind_idx++, batch_no, -1, SQLITE_TRANSIENT);
+    }
+    if (supplier_name != NULL && *supplier_name != '\0') {
+        sqlite3_bind_text(stmt, bind_idx++, supplier_name, -1, SQLITE_TRANSIENT);
+    }
+    if (production_date_from != NULL && *production_date_from != '\0') {
+        sqlite3_bind_text(stmt, bind_idx++, production_date_from, -1, SQLITE_TRANSIENT);
+    }
+    if (production_date_to != NULL && *production_date_to != '\0') {
+        sqlite3_bind_text(stmt, bind_idx++, production_date_to, -1, SQLITE_TRANSIENT);
+    }
+
+    json_t *batches = json_array();
+    int batch_count = 0;
+    int total_unsold = 0;
+    int total_sold = 0;
+
+    int *batch_ids = NULL;
+    size_t batch_ids_size = 0;
+    size_t batch_ids_cap = 16;
+    batch_ids = (int *)malloc(batch_ids_cap * sizeof(int));
+    if (batch_ids == NULL) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(batches);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "MEMORY_ERROR", "内存分配失败");
+    }
+
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (batch_ids_size >= batch_ids_cap) {
+            batch_ids_cap *= 2;
+            int *tmp = (int *)realloc(batch_ids, batch_ids_cap * sizeof(int));
+            if (tmp == NULL) {
+                free(batch_ids);
+                sqlite3_finalize(stmt);
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(batches);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "MEMORY_ERROR", "内存分配失败");
+            }
+            batch_ids = tmp;
+        }
+        batch_ids[batch_ids_size++] = sqlite3_column_int(stmt, 0);
+
+        json_t *it = json_object();
+        json_object_set_new(it, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(it, "batch_no", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(it, "sku", json_string(safe_col_text(stmt, 2)));
+        json_object_set_new(it, "product_name",
+                            json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(it, "supplier_name",
+                            json_string(safe_col_text(stmt, 4)));
+        json_object_set_new(it, "production_date",
+                            json_string(safe_col_text(stmt, 5)));
+        json_object_set_new(it, "arrival_quantity",
+                            json_integer(sqlite3_column_int(stmt, 6)));
+        json_object_set_new(it, "expiry_date",
+                            json_string(safe_col_text(stmt, 7)));
+        json_array_append_new(batches, it);
+        batch_count++;
+    }
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        free(batch_ids);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(batches);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取召回批次失败");
+    }
+
+    json_t *affected_cabinets = json_array();
+    json_t *orders = json_array();
+
+    if (batch_ids_size > 0) {
+        char batch_id_list[1024] = {0};
+        for (size_t i = 0; i < batch_ids_size; ++i) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%s%d",
+                     i == 0 ? "" : ",", batch_ids[i]);
+            strncat(batch_id_list, buf,
+                    sizeof(batch_id_list) - strlen(batch_id_list) - 1);
+        }
+
+        char cabinet_sql[1024];
+        snprintf(cabinet_sql, sizeof(cabinet_sql),
+            "SELECT c.id, c.cabinet_code, c.name, c.location, "
+            "SUM(s.current_quantity) as unsold_quantity "
+            "FROM cabinet_batch_stock s "
+            "JOIN cabinets c ON c.id = s.cabinet_id "
+            "WHERE s.batch_id IN (%s) AND s.current_quantity > 0 "
+            "GROUP BY c.id, c.cabinet_code, c.name, c.location "
+            "ORDER BY c.id;",
+            batch_id_list);
+
+        if (sqlite3_prepare_v2(g_db, cabinet_sql, -1, &stmt, NULL) != SQLITE_OK) {
+            free(batch_ids);
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(batches);
+            json_decref(affected_cabinets);
+            json_decref(orders);
+            return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                "DB_ERROR", "查询受影响柜机失败");
+        }
+
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int qty = sqlite3_column_int(stmt, 4);
+            total_unsold += qty;
+            json_t *it = json_object();
+            json_object_set_new(it, "id",
+                                json_integer(sqlite3_column_int(stmt, 0)));
+            json_object_set_new(it, "cabinet_code",
+                                json_string(safe_col_text(stmt, 1)));
+            json_object_set_new(it, "name",
+                                json_string(safe_col_text(stmt, 2)));
+            json_object_set_new(it, "location",
+                                json_string(safe_col_text(stmt, 3)));
+            json_object_set_new(it, "unsold_quantity", json_integer(qty));
+            json_array_append_new(affected_cabinets, it);
+        }
+        sqlite3_finalize(stmt);
+
+        char order_sql[1024];
+        snprintf(order_sql, sizeof(order_sql),
+            "SELECT o.id, o.order_no, c.cabinet_code, c.name as cabinet_name, "
+            "b.batch_no, p.sku, p.name as product_name, "
+            "o.quantity, o.unit_price_cents, o.total_price_cents, "
+            "o.created_at "
+            "FROM sales_orders o "
+            "JOIN cabinets c ON c.id = o.cabinet_id "
+            "JOIN product_batches b ON b.id = o.batch_id "
+            "JOIN products p ON p.id = o.product_id "
+            "WHERE o.batch_id IN (%s) "
+            "ORDER BY o.id DESC LIMIT 500;",
+            batch_id_list);
+
+        if (sqlite3_prepare_v2(g_db, order_sql, -1, &stmt, NULL) != SQLITE_OK) {
+            free(batch_ids);
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(batches);
+            json_decref(affected_cabinets);
+            json_decref(orders);
+            return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                "DB_ERROR", "查询销售订单失败");
+        }
+
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            total_sold += sqlite3_column_int(stmt, 7);
+            json_t *it = json_object();
+            json_object_set_new(it, "id",
+                                json_integer(sqlite3_column_int(stmt, 0)));
+            json_object_set_new(it, "order_no",
+                                json_string(safe_col_text(stmt, 1)));
+            json_object_set_new(it, "cabinet_code",
+                                json_string(safe_col_text(stmt, 2)));
+            json_object_set_new(it, "cabinet_name",
+                                json_string(safe_col_text(stmt, 3)));
+            json_object_set_new(it, "batch_no",
+                                json_string(safe_col_text(stmt, 4)));
+            json_object_set_new(it, "sku", json_string(safe_col_text(stmt, 5)));
+            json_object_set_new(it, "product_name",
+                                json_string(safe_col_text(stmt, 6)));
+            json_object_set_new(it, "quantity",
+                                json_integer(sqlite3_column_int(stmt, 7)));
+            json_object_set_new(it, "unit_price_cents",
+                                json_integer(sqlite3_column_int(stmt, 8)));
+            json_object_set_new(it, "total_price_cents",
+                                json_integer(sqlite3_column_int(stmt, 9)));
+            json_object_set_new(it, "created_at",
+                                json_string(safe_col_text(stmt, 10)));
+            json_array_append_new(orders, it);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    free(batch_ids);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "affected_batch_count", json_integer(batch_count));
+    json_object_set_new(data, "total_unsold_quantity", json_integer(total_unsold));
+    json_object_set_new(data, "total_sold_quantity", json_integer(total_sold));
+    json_object_set_new(data, "affected_batches", batches);
+    json_object_set_new(data, "affected_cabinets", affected_cabinets);
+    json_object_set_new(data, "sold_orders", orders);
+
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
 static enum MHD_Result route_health(struct MHD_Connection *connection,
                                     ConnectionInfo *ci) {
     (void)ci;
@@ -1804,6 +3141,55 @@ static enum MHD_Result route_movements(struct MHD_Connection *connection,
     return handle_movements(connection);
 }
 
+static enum MHD_Result route_create_supplier(struct MHD_Connection *connection,
+                                             ConnectionInfo *ci) {
+    return handle_create_supplier(connection, ci);
+}
+
+static enum MHD_Result route_list_suppliers(struct MHD_Connection *connection,
+                                            ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_suppliers(connection);
+}
+
+static enum MHD_Result route_create_cabinet(struct MHD_Connection *connection,
+                                            ConnectionInfo *ci) {
+    return handle_create_cabinet(connection, ci);
+}
+
+static enum MHD_Result route_list_cabinets(struct MHD_Connection *connection,
+                                           ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_cabinets(connection);
+}
+
+static enum MHD_Result route_create_batch(struct MHD_Connection *connection,
+                                          ConnectionInfo *ci) {
+    return handle_create_batch(connection, ci);
+}
+
+static enum MHD_Result route_list_batches(struct MHD_Connection *connection,
+                                          ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_batches(connection);
+}
+
+static enum MHD_Result route_place_batch(struct MHD_Connection *connection,
+                                         ConnectionInfo *ci) {
+    return handle_place_batch(connection, ci);
+}
+
+static enum MHD_Result route_cabinet_sales(struct MHD_Connection *connection,
+                                           ConnectionInfo *ci) {
+    return handle_cabinet_sales(connection, ci);
+}
+
+static enum MHD_Result route_recall_query(struct MHD_Connection *connection,
+                                          ConnectionInfo *ci) {
+    (void)ci;
+    return handle_recall_query(connection);
+}
+
 static enum MHD_Result route_openapi_doc(struct MHD_Connection *connection,
                                          ConnectionInfo *ci);
 
@@ -1843,6 +3229,24 @@ static const ApiRoute g_api_routes[] = {
      "库存汇总与明细", "Inventory", 0, 0, 1},
     {MHD_HTTP_METHOD_GET, "/api/v1/movements", route_movements, "Movement History",
      "库存流水查询", "Inventory", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/suppliers", route_create_supplier,
+     "Create Supplier", "新增供应商（管理员）", "Batch", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/suppliers", route_list_suppliers,
+     "List Suppliers", "查询供应商列表", "Batch", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/cabinets", route_create_cabinet,
+     "Create Cabinet", "新增柜机（管理员）", "Batch", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/cabinets", route_list_cabinets,
+     "List Cabinets", "查询柜机列表", "Batch", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/batches", route_create_batch,
+     "Create Batch", "创建批次（批次入库）", "Batch", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/batches", route_list_batches,
+     "List Batches", "查询批次列表", "Batch", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/batch-placements", route_place_batch,
+     "Place Batch", "批次入柜（分配到柜机）", "Batch", 1, 1, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/cabinet-sales", route_cabinet_sales,
+     "Cabinet Sales", "柜机销售（带批次追溯）", "Batch", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/recall", route_recall_query,
+     "Recall Query", "召回查询（受影响柜机/库存/订单）", "Batch", 1, 0, 1},
     {MHD_HTTP_METHOD_GET, "/api/v1/openapi.json", route_openapi_doc,
      "OpenAPI Document", "自动生成的 OpenAPI 文档", "System", 0, 0, 1},
     {MHD_HTTP_METHOD_GET, "/docs", route_swagger_ui, "Swagger UI",
